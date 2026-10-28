@@ -1,5 +1,10 @@
 ---
 title: "Exercício: SARIMA no comércio varejista brasileiro"
+subtitle: "Trabalho de aprendizado da disciplina Financial Analytics · Programa Avançado de Data Science e Decisão (Insper)"
+author: "Beatriz Laurino"
+date: today
+date-format: "DD/MM/YYYY"
+lang: pt-BR
 format: html
 jupyter: python3
 ---
@@ -8,27 +13,6 @@ jupyter: python3
 
 A base é a **PMC** (Pesquisa Mensal do Comércio) do IBGE: índice de volume de vendas no **comércio varejista ampliado** (inclui veículos e materiais de construção), por **Unidade da Federação**, mensal de jan/2004 em diante. Base 2022 = 100, **sem ajuste sazonal**.
 
-Você receberá **uma UF de interesse**, e deve aplicar a análise abaixo:
-
-Setup
-
-1. Criar repositório no GitHub para o exercício, e configurar o GitHub Pages para servir o conteúdo do repositório.
-2. Clonar o repositório e criar um arquivo chamado `template-exercicio-sarima.qmd` (pode usar o template deste exercício, ou criar do zero, e pode usar jupyter notebook no lugar de Quarto, basta converter usando o comando `quarto convert`).
-3. Configure o `uv` com um `.venv` para gerenciar as dependências do exercício (pode usar o `requirements.txt` deste repositório como base, ou criar o seu do zero). Obs: Não é para subir a pasta `.venv` no GitHub, ele precisa estar no seu `.gitignore`.
-
-Código
-
-3. Análise descritiva (linha, ACF, PACF, diferenciação) e diagnóstico de tendência/sazonalidade.
-4. Testes de raiz unitária (ADF, KPSS) e estimativa de `ndiffs`.
-5. Ajuste de SARIMA via `AutoARIMA(season_length=12)`.
-6. Diagnóstico dos resíduos.
-7. Previsão de 24 meses à frente, com intervalos de 80% e 95%.
-
-Análise e entrega
-
-8. Discussão dos resultados (perguntas no final).
-9. Compilar este arquivo em um relatório em HTML chamado index.html e subir no repositório do GitHub que você criou para este lab. 
-10. Configure as github pages para servir o conteúdo do repositório, e compartilhe o link no formulário de entrega do BB.
 
 ## Setup
 
@@ -36,12 +20,20 @@ Análise e entrega
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
 
 from statsmodels.tsa.stattools import adfuller, kpss
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.seasonal import STL
 
 from statsforecast import StatsForecast
 from statsforecast.models import AutoARIMA, ARIMA
+from statsforecast.arima import ndiffs, nsdiffs
+from statsmodels.stats.diagnostic import acorr_ljungbox
+
 ```
 
 ## Carregando a base PMC
@@ -56,7 +48,7 @@ pmc = pd.read_csv("https://github.com/padsInsper/202634-fa/releases/download/dat
 
 ```{python}
 
-MINHA_UF = "Guiana Brasleira" 
+MINHA_UF = "Ceará" 
 
 
 df_sf = (
@@ -66,21 +58,311 @@ df_sf = (
     .reset_index(drop=True)
 )
 
+df_sf["ds"] = pd.to_datetime(df_sf["ds"])
+
+serie = df_sf.set_index("ds")["y"].asfreq("MS")
+
 df_sf.head()
 ```
 
 ## Análise descritiva
 
+### Validação Visual Inicial
+
+Por uma validação inicial dos dados, podemos já identificar alguns pontos:
+- Pico nos meses de Dezembro
+- Vale nos meses de Fevereiro
+- Crescimento (apesar de inconstante) desde 2005
+- Visualmente a variância parece constante
+
+```{python}
+fig = px.line(
+    df_sf, x='ds', y='y',
+    title=f'Volume Mensal do Varejo: {MINHA_UF}',
+    labels={'ds': 'Data', 'y': 'Volume'},
+    template='plotly_white'
+)
+fig.update_layout(
+    font_family="Inter",
+    title_font_size=18,
+    hovermode='x unified'
+)
+fig.show()
+
+```
+
+### Decomposição
+
+A decomposição deixa bem evidente tanto a tendência quanto a sazonalidade
+
+```{python}
+# Decomposição STL
+stl = STL(serie, period=12, robust=True)
+resultado = stl.fit()
+
+fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+
+componentes = {
+    'Observado': serie,
+    'Tendência': resultado.trend,
+    'Sazonalidade': resultado.seasonal,
+    'Resíduo': resultado.resid
+}
+cores = ['tab:blue', 'tab:orange', 'tab:green', 'gray']
+
+for ax, (nome, comp), cor in zip(axes, componentes.items(), cores):
+    ax.plot(comp, color=cor, linewidth=0.8)
+    ax.set_ylabel(nome, fontweight='bold')
+    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
+
+plt.suptitle(f'Decomposição STL: Volume de Vendas {MINHA_UF}', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.show()
+```
+
+### ACF PACF
+
+Avaliando ACF e PACF, vemos um decréscimo lento na autocorrelação e um pico concentrado no M1 da parcial, o que indica não estacionariedade, e a série provavelmente precisa de uma diferenciação.
+
+```{python}
+def plotar_diagnostico(serie, titulo="Série", lags=36):
+    """Plota série + ACF + PACF em layout 3x1"""
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+
+    # Série
+    axes[0].plot(serie, color='tab:blue', linewidth=0.8)
+    axes[0].set_title(f'{titulo}', fontweight='bold', fontsize=14)
+    axes[0].axhline(y=serie.mean(), color='gray', linestyle='--', alpha=0.5)
+
+    # ACF
+    plot_acf(serie.dropna(), ax=axes[1], lags=lags, zero=False,
+             color='gray', vlines_kwargs={'colors': 'gray'})
+    axes[1].set_title('Autocorrelação (ACF)')
+
+    # PACF
+    plot_pacf(serie.dropna(), ax=axes[2], lags=lags, zero=False,
+              color='gray', vlines_kwargs={'colors': 'gray'})
+    axes[2].set_title('Autocorrelação Parcial (PACF)')
+
+    plt.tight_layout()
+    plt.show()
+
+plotar_diagnostico(serie, f'Volume de Vendas: {MINHA_UF}')
+```
+
+### Testes de Estacionariedade
+
+Quando testamos a estacionariedade, confirmamos a hipótese de que a série é não estacionária
+
+```{python}
+def testar_estacionariedade(serie, nome="Série"):
+    """Aplica testes ADF e KPSS e interpreta resultados"""
+    print(f"{'='*50}")
+    print(f"Testes de Estacionariedade: {nome}")
+    print(f"{'='*50}\n")
+
+    # ADF
+    resultado_adf = adfuller(serie.dropna(), autolag='AIC')
+    print(f"Teste ADF (H0: raiz unitária)")
+    print(f"  Estatística: {resultado_adf[0]:.4f}")
+    print(f"  p-valor:     {resultado_adf[1]:.4f}")
+    print(f"  Lags usados: {resultado_adf[2]}")
+
+    if resultado_adf[1] < 0.05:
+        print(f"  → Rejeita H0: evidência de estacionariedade\n")
+    else:
+        print(f"  → Não rejeita H0: evidência de raiz unitária\n")
+
+    # KPSS
+    resultado_kpss = kpss(serie.dropna(), regression='c', nlags='auto')
+    print(f"Teste KPSS (H0: estacionária)")
+    print(f"  Estatística: {resultado_kpss[0]:.4f}")
+    print(f"  p-valor:     {resultado_kpss[1]:.4f}")
+
+    if resultado_kpss[1] < 0.05:
+        print(f"  → Rejeita H0: evidência de não-estacionariedade\n")
+    else:
+        print(f"  → Não rejeita H0: evidência de estacionariedade\n")
+
+    # Conclusão conjunta
+    adf_estacionaria = resultado_adf[1] < 0.05
+    kpss_estacionaria = resultado_kpss[1] >= 0.05
+
+    if adf_estacionaria and kpss_estacionaria:
+        print("CONCLUSÃO: Série provavelmente ESTACIONÁRIA")
+    elif not adf_estacionaria and not kpss_estacionaria:
+        print("CONCLUSÃO: Série provavelmente NÃO ESTACIONÁRIA")
+    else:
+        print("CONCLUSÃO: Resultados INCONCLUSIVOS: análise adicional necessária")
+
+testar_estacionariedade(serie, f'Volume de Vendas: {MINHA_UF}')
+```
+
+### Diferenciação
+
+Após aplicação da primeira diferença, observamos ambas hipóteses (ADF e KPSS) rejeitando H0, o que pode indicar tendência determinística.
+
+Após a primeira diferença, apesar de não observar mais a tendência, ainda vemos claramente os picos sazonais. Vemos no ACF repetições anuais (picos acentuados a cada 12 meses). Por este motivo, cabe adicionarmos uma segunda diferenciação, para remover a sazonalidade.
+
+```{python}
+# Primeira diferença
+serie_diff = serie.diff().dropna()
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+axes[0].plot(serie, color='tab:blue', linewidth=0.8)
+axes[0].set_title(f'{MINHA_UF}: Série Original', fontweight='bold')
+
+axes[1].plot(serie_diff, color='tab:orange', linewidth=0.8)
+axes[1].set_title(f'{MINHA_UF}: Primeira Diferença', fontweight='bold')
+axes[1].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+
+plt.tight_layout()
+plt.show()
+
+# Testes na série diferenciada
+testar_estacionariedade(serie_diff, f'{MINHA_UF} (1ª diferença)')
+```
+
+```{python}
+# Diagnóstico da série diferenciada
+plotar_diagnostico(serie_diff, f'{MINHA_UF}: Primeira Diferença')
+```
+
+Com a segunda diferença removemos a sazonalidade e podemos observar uma série estacionária.
+
+```{python}
+
+# Segunda diferença
+serie_diff_sazonal = serie.diff().diff(12).dropna()
+
+testar_estacionariedade(serie_diff_sazonal, f'{MINHA_UF} (1ª diferença)')
+
+plotar_diagnostico(serie_diff_sazonal, f'{MINHA_UF}: Diferença regular + sazonal')
+```
+
+Rodando ndiffs, confirmamos 1 sazonal e 1 regular
+```{python}
+y = serie.values
+print("nsdiffs (sazonal):", nsdiffs(y, period=12))
+print("ndiffs (regular, após diferença sazonal):", ndiffs(y[12:] - y[:-12]))
+```
+
 ## Modelagem
 
-## Previsão · 24 meses à frente
+### Ajuste do SARIMA via AutoARIMA
+
+```{python}
+# AutoARIMA testa várias ordens (p,d,q)(P,D,Q) e escolhe a de menor AICc.
+# season_length=12 → considera a parte sazonal (série mensal)
+sf = StatsForecast(models=[AutoARIMA(season_length=12)], freq='MS', n_jobs=1)
+sf.fit(df_sf)
+
+modelo = sf.fitted_[0, 0].model_
+
+# Atenção: a ordem em 'arma' é (p, q, P, Q, s, d, D)
+p, q, P, Q, s, d, D = modelo['arma']
+print(f"Modelo escolhido: SARIMA({p},{d},{q})({P},{D},{Q})[{s}]")
+print(f"AICc: {modelo['aicc']:.2f}")
+```
+
+```{python}
+# Coeficientes estimados (ar = AR, ma = MA, sar/sma = partes sazonais)
+pd.Series(modelo['coef'])
+```
+
+```{python}
+sf2 = StatsForecast(models=[ARIMA(order=(0,1,1), seasonal_order=(0,1,1), season_length=12)], freq='MS')
+sf2.fit(df_sf)
+
+modelo2_teste = sf2.fitted_[0, 0].model_
+
+print(modelo2_teste['aicc'])
+```
+
+### Diagnóstico dos resíduos
+Resíduos da série bem baixos, sempre por volta de zero, indicando bom ajuste da previsão do Auto ARIMA
+
+```{python}
+residuos = pd.Series(modelo['residuals'], index=serie.index)
+residuos = residuos.iloc[d + s * D:]
+
+plotar_diagnostico(residuos, f'Resíduos do SARIMA: {MINHA_UF}')
+```
+
+Se simulo a versão manual que testei, vemos que ainda assim os resíduos são baixos, apesar de maiores do que o automático.
+```{python}
+residuos2 = pd.Series(modelo2_teste['residuals'], index=serie.index)
+residuos2 = residuos2.iloc[d + s * D:]
+
+plotar_diagnostico(residuos2, f'Resíduos do SARIMA Manual: {MINHA_UF}')
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.hist(residuos, bins=30, color='tab:blue', edgecolor='white')
+ax.set_title('Histograma dos resíduos')
+plt.show()
+```
+
+```{python}
+# Teste de Ljung-Box (H0: resíduos são ruído branco, sem autocorrelação)
+
+acorr_ljungbox(residuos, lags=[6, 12, 24], model_df=p + q + P + Q)
+```
+
+## Previsão
+
+```{python}
+previsao = sf.predict(h=24, level=[80, 95])
+previsao.head()
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(12, 5))
+
+ax.plot(df_sf['ds'], df_sf['y'], color='tab:blue', linewidth=0.8, label='Histórico')
+
+ax.plot(previsao['ds'], previsao['AutoARIMA'], color='tab:orange', linewidth=1.5, label='Previsão')
+
+# Intervalos de 95% e 80%
+ax.fill_between(previsao['ds'], previsao['AutoARIMA-lo-95'], previsao['AutoARIMA-hi-95'],
+                color='tab:orange', alpha=0.15, label='IC 95%')
+ax.fill_between(previsao['ds'], previsao['AutoARIMA-lo-80'], previsao['AutoARIMA-hi-80'],
+                color='tab:orange', alpha=0.30, label='IC 80%')
+
+ax.set_title(f'Previsão SARIMA 24 meses: {MINHA_UF}')
+ax.legend(loc='upper left')
+plt.tight_layout()
+plt.show()
+```
 
 ## Discussão
 
-Escreva 4-5 linhas comentando:
+### O ACF/PACF da série original sugeriu sazonalidade? E tendência? Bate com o que você viu no gráfico de linha?
 
-1. O ACF/PACF da série original sugeriu sazonalidade? E tendência? Bate com o que você viu no gráfico de linha?
-2. Quantas diferenças (regular e sazonal) o AutoARIMA aplicou? E os componentes AR/MA? Conseguiu observar isso no ACF/PACF?
-3. Os resíduos parecem white noise? Algum padrão remanescente sazonal?
-4. A previsão pareceu razoável visualmente (captura a sazonalidade, fica bem ancorada no histórico, intervalos abrem muito com o horizonte)?
-5. Que outras UFs você imagina que dariam um SARIMA bem diferente do seu (e por quê)? Pense em estados de regiões diferentes, com perfil econômico distinto.
+Sim, tanto ACF/PACF quanto o gráfico de linha inicial sugeriram ambas, e foi possível confirmar conforme fiz as diferenciações. 
+
+
+### Quantas diferenças (regular e sazonal) o AutoARIMA aplicou? E os componentes AR/MA? Conseguiu observar isso no ACF/PACF?
+
+Duas diferenças: uma regular e uma sazonal, o que está alinhado com o que eu analisei no ACF PACF. Quanto a AR/MA, após as duas diferenças o ACF PACF me indicava majoritariamente ruído já, com os lags pequenos em torno de zero. A única coisa que ainda chamava atenção eram os lags de múltiplos de 12, o que talvez indicasse um MA sazonal, mas o autoARIMA escolheu q = 3 e P = 1 o que de fato diminui 18 pontos no AICc comparado com um modelo (0,1,1)(0,1,1), que era o que eu esperava só avaliando ACF PACF.
+
+
+### Os resíduos parecem white noise? Algum padrão remanescente sazonal?
+
+Sim, os resíduos parecem white noise e não resta um claro padrão sazonal.
+
+
+### A previsão pareceu razoável visualmente (captura a sazonalidade, fica bem ancorada no histórico, intervalos abrem muito com o horizonte)?
+
+A previsão parece muito bem ajustada e capturando a tendência + sazonalidade observada no passado. 
+
+
+### Que outras UFs você imagina que dariam um SARIMA bem diferente do seu (e por quê)? Pense em estados de regiões diferentes, com perfil econômico distinto.
+
+A princípio não esperaria que o volume mensal do Varejo mudasse tanto o comportamento ao longo do tempo em outras regiões do Brasil. Eu esperaria que a sazonalidade por exemplo fosse bem consistente em todo o país (volume maior em Dezembro, associado provavelmente a festas de fim de ano/13o salário, seguido por um decréscimo nos primeiros meses do ano).
+
+Apesar disso, pensando em atividade econômica, estados que possuem forte atividade agrícola por exemplo, como Mato Grosso, Goiás, podem mexer na dinâmica de sazonalidade além do mês de dezembro, dado que a renda é bastante atrelada a momentos de colheita. Isso poderia levar a ordens diferentes no SARIMA.
+
+Além disso, pode ser mais provável observarmos mais outros choques inesperados considerando impactos pontuais no agronegócio, o que poderia resultar numa maior variância dos resíduos.
